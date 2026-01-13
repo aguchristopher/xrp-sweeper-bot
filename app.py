@@ -1,114 +1,223 @@
 import os
 import asyncio
-import base64
 from dotenv import load_dotenv
-from xrpl.asyncio.clients import AsyncWebsocketClient
-from mnemonic import Mnemonic
 
-# Load environment variables from .env file
 load_dotenv()
+from xrpl.asyncio.clients import AsyncWebsocketClient
 from xrpl.wallet import Wallet
 from xrpl.models.requests import Subscribe, AccountInfo
 from xrpl.models.transactions import Payment
-from xrpl.asyncio.transaction import autofill, sign, submit_and_wait
-from xrpl.utils import xrp_to_drops
+from xrpl.transaction import sign
+from xrpl.asyncio.transaction import autofill, submit_and_wait
+from xrpl.utils import drops_to_xrp
 
+# ===== CONFIGURATION =====
 XRPL_WS = "wss://xrplcluster.com"
+# XRPL_WS = "wss://s.altnet.rippletest.net:51233"  # Uncomment for Testnet
 
-# Configuration (Loaded from environment variables for security)
-WALLET_SEED = os.environ.get("XRPL_SEED", "")
-DESTINATION = os.environ.get("DESTINATION", "")
+WALLET_SEED = os.getenv("XRPL_SEED")
+DESTINATION = os.getenv("DESTINATION")
 
-if not WALLET_SEED or not DESTINATION:
-    print("Error: XRPL_SEED or DESTINATION environment variables are not set.")
-    print("Please create a .env file or set them in your environment.")
-    exit(1)
+# Validate Environment Variables
+if not WALLET_SEED or not WALLET_SEED.startswith("s"):
+    raise ValueError("Error: XRPL_SEED must be set and start with 's'")
+if not DESTINATION:
+    raise ValueError("Error: DESTINATION address must be set")
 
-BASE_RESERVE = 10        # XRP
-FEE_BUFFER = 0.00002    # XRP
+# ===== XRPL CONSTANTS (2025 Standards) =====
+# 1 XRP = 1,000,000 Drops
+BASE_RESERVE_DROPS = 1_000_000  # 1 XRP required to activate account
+OWNER_RESERVE_DROPS = 200_000  # 0.2 XRP per object (trustline, offer, etc.)
+FEE_BUFFER_DROPS = 50  # buffer to cover network fees (usually 10-12 drops)
+MIN_SWEEP_DROPS = 100_000  # Minimum balance (0.1 XRP) required to trigger sweep
+# ===========================================
 
 
-async def get_balance(client, address):
+def wallets_from_seed(seed):
+    """
+    Generates both SECP256K1 and ED25519 wallets from the same seed
+    to ensure we find the correct account on the ledger.
+    """
+    wallet_secp = Wallet.from_seed(seed, algorithm="secp256k1")
+    wallet_ed = Wallet.from_seed(seed, algorithm="ed25519")
+    return wallet_secp, wallet_ed
+
+
+async def get_account_data_drops(client, address):
+    """
+    Fetches account info and calculates exact spendable drops (integers).
+    Returns None if account is not funded.
+    """
     try:
-        req = AccountInfo(
-            account=address,
-            ledger_index="validated",
-            strict=True
-        )
+        req = AccountInfo(account=address,
+                          ledger_index="validated",
+                          strict=True)
         resp = await client.request(req)
-        
-        if resp.is_error():
-            # Account not found (actNotFound) or other error
-            return 0.0
-            
-        drops = int(resp.result["account_data"]["Balance"])
-        return drops / 1_000_000
+
+        if not resp.result or "account_data" not in resp.result:
+            return None
+
+        data = resp.result["account_data"]
+        balance_drops = int(data["Balance"])
+        owner_count = data.get("OwnerCount", 0)
+
+        # Calculate Reserve
+        reserve_drops = BASE_RESERVE_DROPS + (OWNER_RESERVE_DROPS *
+                                              owner_count)
+
+        # Calculate Spendable (Balance - Reserve - Safety Buffer)
+        spendable_drops = balance_drops - reserve_drops - FEE_BUFFER_DROPS
+
+        return {
+            "balance_drops": balance_drops,
+            "reserve_drops": reserve_drops,
+            "spendable_drops": spendable_drops
+        }
     except Exception:
-        return 0.0
+        # If account doesn't exist yet
+        return None
+
+
+async def perform_sweep(client, wallet, destination, lock):
+    """
+    Safely sweeps funds. Uses a lock to prevent concurrent sweep attempts.
+    """
+    if lock.locked():
+        print(">> Sweep already in progress. Skipping...")
+        return
+
+    async with lock:
+        data = await get_account_data_drops(client, wallet.classic_address)
+
+        if not data:
+            print(">> Error: Could not fetch account data.")
+            return
+
+        spendable = data["spendable_drops"]
+
+        # 1. Safety Check: Negative Spendable
+        # If balance < reserve, spendable will be negative. We cannot convert negative to XRP.
+        if spendable <= 0:
+            print(f">> Funds locked by Reserve (1 XRP). Spendable: 0 XRP")
+            return
+
+        # 2. Threshold Check
+        if spendable < MIN_SWEEP_DROPS:
+            print(
+                f">> Balance too low to sweep. Spendable: {drops_to_xrp(str(spendable))} XRP"
+            )
+            return
+
+        print(
+            f">> Sweeping {drops_to_xrp(str(spendable))} XRP to {destination}..."
+        )
+
+        # 3. Build Transaction
+        payment = Payment(
+            account=wallet.classic_address,
+            destination=destination,
+            amount=str(spendable)  # Amount must be string of drops
+        )
+
+        try:
+            # autofill handles Sequence and Fee calculation
+            prepared = await autofill(payment, client)
+            signed = sign(prepared, wallet)
+            result = await submit_and_wait(signed, client)
+
+            tx_result = result.result.get("meta",
+                                          {}).get("TransactionResult",
+                                                  "UNKNOWN")
+
+            if tx_result == "tesSUCCESS":
+                print(f">> SUCCESS: Transferred funds. Result: {tx_result}")
+            else:
+                print(f">> FAILURE: Transaction failed. Result: {tx_result}")
+
+        except Exception as e:
+            print(f">> Sweep Error: {e}")
 
 
 async def main():
-    try:
-        # Detect if it's a mnemonic phrase (multiple words) 
-        # or a family seed (single string)
-        if len(WALLET_SEED.split()) > 1:
-            print("Mnemonic phrase detected. Deriving wallet...")
-            # Convert mnemonic to entropy for Wallet.from_entropy
-            mnemo = Mnemonic("english")
-            entropy = mnemo.to_entropy(WALLET_SEED)
-            wallet = Wallet.from_entropy(entropy.hex())
-        else:
-            print("Family seed detected. Initializing wallet...")
-            wallet = Wallet.from_seed(WALLET_SEED)
-            
-    except Exception as e:
-        print(f"Error initializing wallet: {e}")
-        print("\nNote: Ensure your seed starts with 's' or your mnemonic is 12/24 valid words.")
-        return
+    wallet_secp, wallet_ed = wallets_from_seed(WALLET_SEED)
+    sweep_lock = asyncio.Lock()
 
     async with AsyncWebsocketClient(XRPL_WS) as client:
-        balance = await get_balance(client, wallet.address)
-        print(f"Listening on {wallet.address}")
-        print(f"Current Balance: {balance:.6f} XRP")
+        print(f"Connected to {XRPL_WS}")
 
-        await client.request(
-            Subscribe(accounts=[wallet.address])
-        )
+        # 1. Determine Active Wallet
+        print("Checking account status...")
+        data_secp = await get_account_data_drops(client,
+                                                 wallet_secp.classic_address)
+        data_ed = await get_account_data_drops(client,
+                                               wallet_ed.classic_address)
 
+        if data_ed:
+            wallet = wallet_ed
+            print(f"Active Wallet (ED25519): {wallet.classic_address}")
+        elif data_secp:
+            wallet = wallet_secp
+            print(f"Active Wallet (SECP256K1): {wallet.classic_address}")
+        else:
+            print(
+                f"Account {wallet_secp.classic_address} not found (not funded)."
+            )
+            print("Waiting for initial funding (needs > 1 XRP)...")
+            wallet = wallet_secp
+
+        # 2. Subscribe to Ledger Updates
+        print(f"Subscribing to updates for {wallet.classic_address}...")
+        await client.request(Subscribe(accounts=[wallet.classic_address]))
+
+        # 3. Initial Sweep Check (Clear out existing funds on startup)
+        if data_ed or data_secp:
+            await perform_sweep(client, wallet, DESTINATION, sweep_lock)
+
+        # 4. Main Event Loop
+        print("Listening for incoming transactions...")
         async for msg in client:
-            if "transaction" not in msg:
+            # Only process validated ledger messages
+            if not msg.get("validated", False):
                 continue
 
-            tx = msg["transaction"]
+            # PARSING FIX: Handle both 'transaction' and 'tx_json' formats
+            tx = None
+            if "transaction" in msg:
+                tx = msg["transaction"]
+            elif "tx_json" in msg:
+                tx = msg["tx_json"]
 
-            if (
-                tx.get("TransactionType") == "Payment"
-                and tx.get("Destination") == wallet.address
-                and msg.get("validated") is True
-            ):
-                print("Incoming XRP detected")
+            if not tx:
+                continue
 
-                balance = await get_balance(client, wallet.address)
-                sendable = balance - BASE_RESERVE - FEE_BUFFER
+            # FILTER: Payment + Destination is Us + Account is NOT Us
+            if (tx.get("TransactionType") == "Payment"
+                    and tx.get("Destination") == wallet.classic_address
+                    and tx.get("Account") != wallet.classic_address):
 
-                if sendable <= 0:
-                    print("Insufficient balance to sweep")
+                # Extract amount (Check delivered_amount if available for accuracy)
+                amount = tx.get("Amount")
+                if "meta" in msg and "delivered_amount" in msg["meta"]:
+                    amount = msg["meta"]["delivered_amount"]
+
+                # Ignore Token Payments (Non-XRP payments are dicts)
+                if isinstance(amount, dict):
+                    print(
+                        "Token payment received. Ignoring (XRP only script).")
                     continue
 
-                payment = Payment(
-                    account=wallet.address,
-                    destination=DESTINATION,
-                    amount=xrp_to_drops(sendable)
-                )
+                print(f"Incoming Payment Detected: {drops_to_xrp(amount)} XRP")
 
-                prepared = await autofill(payment, client)
-                signed = sign(prepared, wallet)
-                result = await submit_and_wait(signed, client)
+                # Small delay to allow the node to update AccountInfo state
+                await asyncio.sleep(1)
 
-                print(
-                    f"Swept {sendable:.6f} XRP | "
-                    f"Result: {result.result['meta']['TransactionResult']}"
-                )
+                # Launch sweep in background
+                asyncio.create_task(
+                    perform_sweep(client, wallet, DESTINATION, sweep_lock))
 
 
-asyncio.run(main())
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\nStopping sweeper...")
